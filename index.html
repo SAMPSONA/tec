@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Gradient Boosting 3D Visualization</title>
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <style>
+    html,body{height:100%;margin:0;font-family:Arial,Helvetica,sans-serif;background:#ffffff;color:#111}
+    .wrap{max-width:1100px;margin:24px auto 18px;padding:0 12px}
+    h1{margin:0 0 8px;font-size:32px;font-weight:700;letter-spacing:.2px}
+    #plot{width:100%;height:680px;border:1px solid #e5e7eb;border-radius:8px}
+    .ctrlbar{
+      display:flex;align-items:center;gap:10px;margin:14px 2px 0;
+      font-size:15px;color:#111;
+    }
+    .ctrlbar label{font-weight:600}
+    #tree-slider{width:520px}
+    input[type="range"]{accent-color:#2563eb}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Gradient Boosting 3D Visualization</h1>
+    <div id="plot"></div>
+    <div class="ctrlbar">
+      <label for="tree-slider">Tree:</label>
+      <input id="tree-slider" type="range" min="1" max="100" value="1" step="1">
+      <span id="tree-num">1</span>
+    </div>
+  </div>
+
+<script>
+/* -----------------------------------------------------------
+   3D Gradient Boosting (x,y)->z with axis-aligned stumps.
+   UI intentionally minimal to match your screenshot.
+------------------------------------------------------------*/
+
+(function(){
+  // ---- Config ----
+  const N_POINTS = 240;
+  const MAX_TREES = 100;
+  const X_MIN = -10, X_MAX = 10;
+  const Y_MIN = -10, Y_MAX = 10;
+  const GRID_NX = 60, GRID_NY = 60;
+  const LEARNING_RATE = 0.15;
+
+  // ---- DOM ----
+  const slider = document.getElementById('tree-slider');
+  const treeNum = document.getElementById('tree-num');
+
+  // ---- Data holders ----
+  let X=[], Y=[], Z=[];
+  let gridX=[], gridY=[];
+  let ensemble=[];
+
+  // ---- Helpers ----
+  const linspace = (a,b,n)=>Array.from({length:n},(_,i)=>a+(b-a)*i/(n-1));
+
+  function rng(seed=0.42){
+    let s = Math.floor(seed*1e6)%2147483647 || 1;
+    return ()=>{ s=(s*48271)%2147483647; return s/2147483647; };
+  }
+
+  // bowl-like true function to resemble your point cloud
+  function f_true(x,y){ return 0.8*x*x + 0.6*y*y + 10*Math.sin(0.35*x*y); }
+
+  function genData(seed=0.42){
+    const r = rng(seed);
+    X=[];Y=[];Z=[];
+    for(let i=0;i<N_POINTS;i++){
+      const x = X_MIN + (X_MAX-X_MIN)*r();
+      const y = Y_MIN + (Y_MAX-Y_MIN)*r();
+      const noise = (r()-0.5)*18; // z-noise
+      X.push(x); Y.push(y); Z.push(f_true(x,y)+noise);
+    }
+    gridX = linspace(X_MIN, X_MAX, GRID_NX);
+    gridY = linspace(Y_MIN, Y_MAX, GRID_NY);
+  }
+
+  function fitStump2D(xs, ys, resid){
+    let best = {mse: Infinity, axis:'x', thr: 0, left:0, right:0};
+
+    function scan(axis){
+      const arr = xs.map((x,i)=>({k: axis==='x'?x:ys[i], r: resid[i]}))
+                    .sort((a,b)=>a.k-b.k);
+      const k = arr.map(o=>o.k), r = arr.map(o=>o.r);
+      const pref=[0], pref2=[0];
+      for(let i=0;i<r.length;i++){ pref.push(pref[i]+r[i]); pref2.push(pref2[i]+r[i]*r[i]); }
+      for(let i=1;i<k.length;i++){
+        if(k[i]===k[i-1]) continue;
+        const thr = 0.5*(k[i]+k[i-1]);
+        const nL=i, nR=r.length-i;
+        const sumL=pref[i], sumR=pref[r.length]-pref[i];
+        const sum2L=pref2[i], sum2R=pref2[r.length]-pref2[i];
+        const muL=nL?sumL/nL:0, muR=nR?sumR/nR:0;
+        const mseL=nL?(sum2L-2*muL*sumL+nL*muL*muL):0;
+        const mseR=nR?(sum2R-2*muR*sumR+nR*muR*muR):0;
+        const mse=(mseL+mseR)/r.length;
+        if(mse<best.mse) best={mse, axis, thr, left:muL, right:muR};
+      }
+    }
+    scan('x'); scan('y');
+    return best;
+  }
+
+  const predStump = (s,x,y)=> (s.axis==='x' ? x<=s.thr : y<=s.thr) ? s.left : s.right;
+
+  function trainBoost(xs, ys, zs, nTrees, lr){
+    let F = new Array(zs.length).fill(0);
+    const learners=[];
+    for(let t=0;t<nTrees;t++){
+      const res = zs.map((z,i)=>z-F[i]);
+      const s = fitStump2D(xs,ys,res);
+      learners.push(s);
+      for(let i=0;i<zs.length;i++) F[i]+= lr*predStump(s,xs[i],ys[i]);
+    }
+    return learners;
+  }
+
+  function predEnsemble(learners, lr, xs, ys, k=null){
+    const K = k==null ? learners.length : Math.min(k, learners.length);
+    const out = new Array(xs.length).fill(0);
+    for(let t=0;t<K;t++){
+      const s = learners[t];
+      for(let i=0;i<xs.length;i++) out[i]+= lr*predStump(s,xs[i],ys[i]);
+    }
+    return out;
+  }
+
+  function surfaceZ(learners, lr, k){
+    const Zg=[];
+    for(let j=0;j<gridY.length;j++){
+      const rowX=[], rowY=[];
+      for(let i=0;i<gridX.length;i++){ rowX.push(gridX[i]); rowY.push(gridY[j]); }
+      Zg.push( predEnsemble(learners, lr, rowX, rowY, k) );
+    }
+    return Zg;
+  }
+
+  // ---- Plot ----
+  function initPlot(){
+    const k=1;
+    const Zsurf = surfaceZ(ensemble, LEARNING_RATE, k);
+
+    const data = [
+      {
+        type:'scatter3d', mode:'markers', name:'data',
+        x:X, y:Y, z:Z,
+        marker:{size:3.5, color:'#1f77b4', opacity:0.9}
+      },
+      {
+        type:'surface', name:'model',
+        x:gridX, y:gridY, z:Zsurf,
+        showscale:false, opacity:0.95, colorscale:'YlGnBu'
+      }
+    ];
+
+    Plotly.newPlot('plot', data, {
+      margin:{l:0,r:0,t:0,b:0},
+      paper_bgcolor:'#ffffff',
+      scene:{
+        xaxis:{title:'x', gridcolor:'#e5e7eb', zeroline:false},
+        yaxis:{title:'y', gridcolor:'#e5e7eb', zeroline:false},
+        zaxis:{title:'z', gridcolor:'#e5e7eb', zeroline:false},
+        camera:{eye:{x:1.6,y:1.4,z:1.05}}
+      },
+      showlegend:false
+    }, {displayModeBar:true, responsive:true});
+  }
+
+  function refresh(k){
+    treeNum.textContent = String(k);
+    const Zsurf = surfaceZ(ensemble, LEARNING_RATE, k);
+    Plotly.animate('plot', { data: [ null, { z: Zsurf } ] }, {
+      transition:{duration:120, easing:'linear'},
+      frame:{duration:0, redraw:true}
+    });
+  }
+
+  // ---- Boot ----
+  genData(0.42);
+  ensemble = trainBoost(X, Y, Z, MAX_TREES, LEARNING_RATE);
+  initPlot();
+
+  // ---- Events ----
+  slider.addEventListener('input', () => refresh(+slider.value));
+})();
+</script>
+</body>
+</html>
